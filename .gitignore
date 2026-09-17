@@ -1,0 +1,20 @@
+# 학교 내부 문서 - 저장소에 올리지 않는다
+*.pdf
+*.hwp
+*.hwpx
+
+# 인덱스 산출물 - build.py로 재생성 가능하고, 원문 텍스트를 담고 있다
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# 에디터 / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
