@@ -12,10 +12,11 @@ import json
 import pathlib
 
 import numpy as np
+import pymupdf
 import streamlit as st
 
 import ask
-from ask import answer_rules, build_context
+from ask import CITE, answer_rules, build_context, cited
 from chat import ANSWER, call_stream, format_history, rewrite
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -42,11 +43,65 @@ def use_index(name):
 
 
 
-def source_line(hits, meta):
-    def label(c):
-        date = f", {c.get('date', '미상')}" if meta else ""
-        return f"{c['doc']} p.{c['page']}{date}"
-    return "출처: " + " · ".join(sorted({label(c) for c, _ in hits}))
+PAGE_VIEW_HEIGHT = 520   # 출처 페이지 미리보기 상자 높이(px). 넘치면 상자 안에서 스크롤
+
+
+@st.cache_resource
+def pdf_paths():
+    """청크의 doc 값(파일명)으로 원본 PDF 를 찾는다."""
+    return {p.stem: p for p in ROOT.glob("*/*.pdf")}
+
+
+@st.cache_data(show_spinner=False)
+def page_png(doc, page):
+    """출처 페이지를 그때그때 렌더링한다. 인덱스에는 이미지를 저장하지 않는다."""
+    path = pdf_paths().get(doc)
+    if path is None:
+        return None
+    with pymupdf.open(path) as d:
+        if not 1 <= page <= d.page_count:
+            return None
+        return d[page - 1].get_pixmap(dpi=110).tobytes("png")
+
+
+def show_pages(hits, answer, limit=5):
+    """답변 근거가 된 원본 페이지를 보여준다.
+
+    모델은 "오른쪽 빨간 상자", "점 9개 모양 버튼" 같은 화면 형태를 말로 옮기지
+    못한다. 절차 안내에서는 그게 중요하므로 사람이 원본을 직접 보게 한다.
+    답변이 [번호] 로 인용한 페이지만 띄우고, 인용이 없으면(찾을 수 없음 등) 띄우지 않는다.
+    """
+    pages = list(cited(answer, hits).items())[:limit]
+    if not pages:
+        return
+    with st.expander(f"📄 답변에 인용된 페이지 보기 ({len(pages)}쪽)"):
+        tabs = st.tabs([f"{''.join(f'[{n}]' for n in nums)} {doc[:14]} p.{page}"
+                        for (doc, page), nums in pages])
+        for tab, ((doc, page), _) in zip(tabs, pages):
+            with tab:
+                png = page_png(doc, page)
+                if not png:
+                    st.caption("원본 PDF 를 찾을 수 없습니다.")
+                    continue
+                # 높이를 고정한 스크롤 상자에 넣는다. 칸 너비에 맞춰 늘어나는 이미지를
+                # 그냥 두면, 페이지 높이가 바뀔 때마다 세로 스크롤바가 생겼다 사라지며
+                # 화면 폭이 달라지고 → 이미지 크기가 다시 바뀌는 순환이 생겨 화면이 흔들린다.
+                with st.container(height=PAGE_VIEW_HEIGHT, border=False):
+                    st.image(png, width="stretch")
+                st.caption(f"{doc} p.{page}")
+
+
+def source_line(hits, answer, meta):
+    """답변의 [번호] 가 가리키는 문서·페이지를 적는다. 인용이 없으면 빈 문자열."""
+    pages = cited(answer, hits)
+    if not pages:
+        return ""
+    dates = {c["doc"]: c.get("date", "미상") for c, _ in hits}
+    return "출처: " + " · ".join(
+        "".join(f"[{n}]" for n in nums) + f" {doc} p.{page}"
+        + (f", {dates[doc]}" if meta else "")
+        for (doc, page), nums in pages.items()
+    )
 
 
 def render_hits(turn):
@@ -55,13 +110,30 @@ def render_hits(turn):
         st.info(f"검색어 재작성 → {turn['query']}")
 
     for rank, (chunk, score) in enumerate(turn["hits"], start=1):
-        st.markdown(f"**#{rank}**  ·  **`{score:.4f}`**  ·  {chunk['doc']} p.{chunk['page']}")
+        # 번호는 답변의 [번호] 인용과 같다
+        st.markdown(f"**[{rank}]**  ·  **`{score:.4f}`**  ·  {chunk['doc']} p.{chunk['page']}")
         st.progress(min(max(score, 0.0), 1.0))
         with st.expander("청크 내용"):
             st.text(chunk["text"])
 
 
 st.set_page_config(page_title="DGIST 매뉴얼 도우미", layout="wide")
+st.markdown(
+    """<style>
+    /* 스크롤바 자리를 항상 비워 둔다. 출처 페이지를 펼쳐 화면이 길어질 때
+       스크롤바가 새로 생기며 두 칼럼 폭이 한 번에 줄어드는 흔들림을 막는다. */
+    html, [data-testid='stMain'] { scrollbar-gutter: stable; }
+
+    /* 검색 결과 칼럼을 화면에 붙여 둔다. 대화가 길어져 아래로 스크롤해도
+       오른쪽 검색 결과는 따라 내려온다. */
+    [data-testid='stColumn']:has(.st-key-ret_pane) {
+        position: sticky; top: 3.75rem; align-self: flex-start;
+    }
+    /* 검색 결과가 화면보다 길면 칼럼 안에서만 스크롤 (아래 질문 입력창을 피해 높이를 잡음) */
+    .st-key-ret_pane { max-height: calc(100vh - 12rem); overflow-y: auto; }
+    </style>""",
+    unsafe_allow_html=True,
+)
 st.title("DGIST 행정 매뉴얼 도우미")
 st.caption("bge-m3 검색 + qwen3:8b 생성 · 사이드바에서 Baseline 과 개선안을 바꿔가며 비교할 수 있습니다")
 
@@ -98,13 +170,16 @@ with st.sidebar:
 col_chat, col_ret = st.columns([3, 2])
 pending = st.session_state.pending
 
+# 대화는 페이지와 함께 스크롤하고, 검색 결과 칼럼만 화면에 붙여 둔다 (CSS 는 위쪽).
+# 대화가 길어져도 검색 결과를 보려고 맨 위로 올라갈 필요가 없다.
 with col_ret:
     st.subheader("검색 결과")
-    latest = pending or (st.session_state.turns[-1] if st.session_state.turns else None)
-    if latest is None:
-        st.caption("질문을 입력하면 검색된 청크와 점수가 표시됩니다.")
-    else:
-        render_hits(latest)
+    with st.container(key="ret_pane", border=True):
+        latest = pending or (st.session_state.turns[-1] if st.session_state.turns else None)
+        if latest is None:
+            st.caption("질문을 입력하면 검색된 청크와 점수가 표시됩니다.")
+        else:
+            render_hits(latest)
 
 with col_chat:
     for turn in st.session_state.turns:
@@ -112,7 +187,8 @@ with col_chat:
             st.write(turn["question"])
         with st.chat_message("assistant"):
             st.markdown(turn["answer"])
-            st.caption(source_line(turn["hits"], turn.get("meta", False)))
+            st.caption(source_line(turn["hits"], turn["answer"], turn.get("meta", False)))
+            show_pages(turn["hits"], turn["answer"])
 
     # 검색까지 끝난 질문이 있으면 여기서 답변을 스트리밍한다
     if pending:
@@ -121,13 +197,15 @@ with col_chat:
         with st.chat_message("assistant"):
             history = [(t["question"], t["answer"]) for t in st.session_state.turns]
             prompt = ANSWER.format(
-                rules=answer_rules(pending["meta"]),
+                cite=CITE,
+                rules=answer_rules(pending["meta"], pending["hits"]),
                 history=format_history(history),
                 context=build_context(pending["hits"], meta=pending["meta"]),
                 question=pending["question"],
             )
             answer = st.write_stream(call_stream(prompt))
-            st.caption(source_line(pending["hits"], pending["meta"]))
+            st.caption(source_line(pending["hits"], answer, pending["meta"]))
+            show_pages(pending["hits"], answer)
 
         st.session_state.turns.append({**pending, "answer": answer})
         st.session_state.pending = None

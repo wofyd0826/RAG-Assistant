@@ -7,12 +7,14 @@
 페이지 결과를 cache/vlm/ 에 저장하므로 중간에 멈춰도 이어서 돌릴 수 있다.
 베이스라인 data/ 는 건드리지 않고 data_vlm/ 에 저장한다 (A/B 비교용).
 
-실행:  python src/build_vlm.py
+실행:  python src/build_vlm.py          (청크 500자 -> data_vlm/)
+       python src/build_vlm.py 1000     (청크 1000자 -> data_vlm_1000/, 크기 비교 실험용)
 """
 import base64
 import hashlib
 import json
 import pathlib
+import sys
 import time
 
 import numpy as np
@@ -22,14 +24,18 @@ import requests
 from docmeta import doc_date, doc_lang
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-DATA = ROOT / "data_vlm"
+CHUNK = int(sys.argv[1]) if len(sys.argv) > 1 else 500
+OVERLAP = CHUNK // 5    # 텍스트 페이지 겹침. 베이스라인과 같은 20%
+DATA = ROOT / ("data_vlm" if CHUNK == 500 else f"data_vlm_{CHUNK}")
 CACHE = ROOT / "cache" / "vlm"
+TITLES = ROOT / "cache" / "title"   # build_titles.py 가 만든다. 없으면 제목 없이 진행
+NOT_TITLES = {"대구경북과학기술원", "DGIST"}   # 제목 띠가 없는 페이지에서 로고 글자를 읽은 경우
 
 EMBED_MODEL, VLM = "bge-m3", "qwen2.5vl:7b"
 LOW_TEXT = 200          # 이보다 짧은 페이지는 이미지로 본다
 MAX_LINE = 20           # 가장 긴 줄이 이보다 짧으면 산문이 아니라 조각난 레이아웃이다
 TAB_ROWS, TAB_COLS = 4, 3   # 이 크기 이상의 표가 있으면 VLM으로 다시 읽는다
-CHUNK, MIN_LEN, BATCH = 500, 40, 16
+MIN_LEN, BATCH = 40, 16
 
 MAX_OUT = 2048      # 생성 토큰 상한. 표에서 같은 셀을 무한 반복하는 폭주를 막는다
 MAX_CHARS = 6000    # 한 페이지 결과가 이보다 길면 반복 루프로 보고 버린다
@@ -158,6 +164,34 @@ def split_page(text, doc, page):
     return out
 
 
+def split_text(text, doc, page):
+    """텍스트 추출 페이지는 베이스라인과 같이 글자 수로 자르고 20% 겹친다.
+
+    추출 텍스트는 줄바꿈을 공백으로 합친 한 줄이라 split_page 의 빈 줄 기준으로는
+    나뉘지 않는다. 예전에는 이 때문에 텍스트 페이지가 통째로(최대 4천 자) 한 청크였다.
+    """
+    return [{"doc": doc, "page": page, "text": text[i:i + CHUNK]}
+            for i in range(0, len(text), CHUNK - OVERLAP)
+            if len(text[i:i + CHUNK]) >= MIN_LEN]
+
+
+def page_title(stem, pageno, text):
+    """본문에 빠진 페이지 제목.
+
+    본문에 이미 있거나, 머리말의 문서명을 제목으로 읽은 경우에는 붙이지 않는다.
+    문서명은 search_text 에 이미 들어가 있어 새 정보가 아니다.
+    """
+    path = TITLES / stem / f"{pageno:03d}.txt"
+    if not path.exists():
+        return ""
+    title = path.read_text(encoding="utf-8").strip()
+    squash = lambda s: "".join(s.split())
+    if (not title or title in NOT_TITLES
+            or squash(title) in squash(text) or squash(title) in squash(stem)):
+        return ""
+    return title
+
+
 def embed(texts):
     res = requests.post(
         "http://localhost:11434/api/embed",
@@ -183,11 +217,12 @@ def main():
         seen.add(digest)
 
         doc = pymupdf.open(pdf)
-        texts = []
+        texts, hows = [], []
         for pageno, page in enumerate(doc, start=1):
             text, how = read_page(page, CACHE / pdf.stem / f"{pageno:03d}.txt")
             stat[how] += 1
             texts.append(text)
+            hows.append(how)
             done = stat["vlm"] + stat["cache"] + stat["text"] + stat["fallback"]
             print(f"[{n}/{len(pdfs)}] {done}p  vlm={stat['vlm']} cache={stat['cache']} "
                   f"text={stat['text']} fallback={stat['fallback']} dup={stat['dup']}  "
@@ -198,8 +233,16 @@ def main():
         # 언어는 VLM 추출 결과로 판정한다. 원본 텍스트가 0자인 문서가 많아
         # get_text() 기준으로는 국문 매뉴얼도 한글 비율 0 으로 나온다.
         lang = doc_lang(" ".join(texts[:6]))
-        for pageno, text in enumerate(texts, start=1):
-            for chunk in split_page(text, pdf.stem, pageno):
+        for pageno, (text, how) in enumerate(zip(texts, hows), start=1):
+            # VLM 결과(문단·표 구조가 있음)는 문단 단위로, 추출 텍스트는 글자 수로 자른다
+            split = split_text if how in ("text", "fallback") else split_page
+            # VLM 본문이 제목 띠를 빠뜨린 페이지는 제목을 모든 청크 앞에 붙인다.
+            # 제목만 다르고 본문이 거의 같은 페이지(법인카드 / 연구비카드 절차)를
+            # 검색도 LLM 도 구분할 수 있게 된다.
+            title = page_title(pdf.stem, pageno, text)
+            for chunk in split(text, pdf.stem, pageno):
+                if title:
+                    chunk["text"] = f"[{title}]\n{chunk['text']}"
                 chunk["date"], chunk["lang"] = date, lang
                 # 검색에만 쓰는 텍스트. 문서명을 붙여 두지 않으면 본문에 없는
                 # 단어("업무용", "모바일")로는 그 문서를 찾을 수 없다.

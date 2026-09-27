@@ -8,6 +8,7 @@
 import json
 import os
 import pathlib
+import re
 import sys
 
 import numpy as np
@@ -41,24 +42,33 @@ TOP_K = 5
 DATE_RULE = """
 참고 문서의 대괄호 안에는 작성일이 있다. 답을 쓰기 전에 아래를 순서대로 하라.
 
-1. 같은 사안을 다룬 문서가 여러 시점에 걸쳐 있는지 확인하라. 문서 제목이 달라도
+1. 작성일이 서로 다른 문서들이 같은 사안을 다루는지 확인하라. 문서명이 달라도
    같은 목록이나 같은 기준을 싣고 있으면 같은 사안으로 본다.
-2. 그런 경우 작성일을 비교해 가장 늦은 문서 하나만 근거로 삼아라. 서로 다른 시점의
+   같은 문서의 다른 페이지이거나 작성일이 같은 문서는 버전 관계가 아니다.
+   이 규칙을 적용하지 말고, 페이지 제목(본문 첫 줄의 대괄호)을 보고 질문에 맞는 쪽을 골라라.
+2. 1에 해당하면 작성일을 비교해 가장 늦은 문서 하나만 근거로 삼아라. 서로 다른 시점의
    목록·표·기준을 합치거나 "추가로 이런 것도 있습니다" 식으로 나란히 나열하지 마라.
 3. 오래된 문서에는 있는데 최신 문서에는 없는 항목은 더 이상 유효하지 않은 것이다.
    답에 포함하지 말고, 예전에는 있었으나 지금은 빠졌다는 사실만 따로 알려라.
-4. 1~3에 해당해서 여러 시점 중 하나를 골랐을 때만, 답 끝에 그 문서의 작성 연월을
-   밝혀라. 예: "2026년 4월 기준입니다." 그런 선택을 하지 않았다면 적지 마라.
-   답을 찾을 수 없다고 답할 때도 적지 마라.
+4. 1~3에 해당해서 여러 시점 중 하나를 골랐을 때만, 답 끝에 고른 문서의 작성일을
+   "…기준입니다" 형식으로 밝혀라. 작성일에 적힌 만큼만 써라(연도만 있으면 연도만).
+   그런 선택을 하지 않았다면 적지 마라. 답을 찾을 수 없다고 답할 때도 적지 마라.
 
 주제가 실제로 다른 문서라면(신청 방법 안내와 점검 절차 안내 등) 오래됐다는 이유만으로
 배제하지는 마라.
 """
+# 출처는 참고 문서 번호로만 받는다. 예전에는 [문서명 p.페이지] 를 직접 쓰게 했는데,
+# 같은 문서의 비슷한 페이지(법인카드 p.4 / 연구비카드 p.5)가 함께 들어오면
+# 8B 모델이 내용은 p.4 로 쓰고 인용은 p.5 로 옮겨 적는 일이 잦았다.
+# 짧은 번호는 정확히 옮기고, 번호를 문서·페이지로 바꾸는 일은 코드(cited)가 한다.
+CITE = """각 단계나 문장 끝에 근거가 된 참고 문서의 번호를 [1], [2] 처럼 붙여라.
+문서명이나 페이지를 직접 쓰지 말고 번호만 써라."""
+
 PROMPT = """당신은 DGIST 행정 매뉴얼 안내 도우미다.
 
 아래 [참고 문서]만 근거로 답하라. 문서에 없는 내용은 절대 지어내지 말고,
 근거가 없으면 "제공된 매뉴얼에서 찾을 수 없습니다"라고만 답하라.
-절차를 설명할 때는 각 단계 끝에 [문서명 p.페이지] 형식으로 출처를 붙여라.
+{cite}
 {rules}
 [참고 문서]
 {context}
@@ -72,18 +82,50 @@ def _meta(flag):
     return META if flag is None else flag
 
 
-def answer_rules(meta=None):
-    return DATE_RULE if _meta(meta) else ""
+def answer_rules(meta=None, hits=None):
+    """날짜 규칙은 검색된 청크의 작성일이 실제로 둘 이상일 때만 넣는다.
+
+    8B 모델은 "같은 날짜면 적용하지 마라" 를 지키지 못했다. 한 문서의 p.4(법인카드)와
+    p.5(연구비카드)만 검색됐는데도 "가장 늦은 문서" 를 고르려다 p.4 내용을 p.5 로
+    인용했다. 규칙이 필요 없는 경우는 코드에서 걸러낸다.
+    """
+    if not _meta(meta):
+        return ""
+    if hits is not None:
+        dates = {c.get("date", "미상") for c, _ in hits} - {"미상"}
+        if len(dates) < 2:
+            return ""
+    return DATE_RULE
 
 
 def build_context(hits, meta=None):
-    """meta 모드에서는 작성일을 같이 넣어 LLM 이 최신본을 고를 수 있게 한다."""
-    if _meta(meta):
-        return "\n\n".join(
-            f"[{c['doc']} p.{c['page']}, {c.get('date', '미상')}]\n{c['text']}"
-            for c, _ in hits
-        )
-    return "\n\n".join(f"[{c['doc']} p.{c['page']}]\n{c['text']}" for c, _ in hits)
+    """청크마다 [번호] 를 붙인다. 답변은 이 번호로 출처를 단다.
+
+    meta 모드에서는 작성일을 같이 넣어 LLM 이 최신본을 고를 수 있게 한다.
+    """
+    def head(n, c):
+        date = f" (작성일 {c.get('date', '미상')})" if _meta(meta) else ""
+        return f"[{n}] {c['doc']} p.{c['page']}{date}"
+    return "\n\n".join(f"{head(n, c)}\n{c['text']}" for n, (c, _) in enumerate(hits, start=1))
+
+
+CITE_RE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
+
+
+def cited(answer, hits):
+    """답변의 [번호] 인용을 (문서, 페이지) 로 바꾼다. 처음 인용된 순서대로, 중복 없이.
+
+    돌려주는 값은 {(문서, 페이지): [번호, ...]} 이다. 없는 번호는 버린다.
+    """
+    out = {}
+    for m in CITE_RE.finditer(answer):
+        for n in (int(x) for x in m.group(1).split(",")):
+            if 1 <= n <= len(hits):
+                c = hits[n - 1][0]
+                nums = out.setdefault((c["doc"], c["page"]), [])
+                if n not in nums:
+                    nums.append(n)
+    return out
 
 
 def embed(text):
@@ -149,7 +191,8 @@ def generate(question, hits):
         json={
             "model": LLM,
             "messages": [
-                {"role": "user", "content": PROMPT.format(rules=answer_rules(), context=context, question=question)}
+                {"role": "user", "content": PROMPT.format(cite=CITE, rules=answer_rules(hits=hits),
+                                                          context=context, question=question)}
             ],
             "think": False,  # 베이스라인은 사고 과정 없이 빠르게
             "stream": False,
@@ -174,13 +217,14 @@ def main():
     print(f"\n[질문] {question}\n")
     print("[검색된 청크]")
     for rank, (c, score) in enumerate(hits, start=1):
-        print(f"  #{rank} score={score:.3f}  {c['doc']} p.{c['page']}")
+        print(f"  [{rank}] score={score:.3f}  {c['doc']} p.{c['page']}")
         print(f"      {c['text'][:80]}...")
 
-    print(f"\n[답변]\n{generate(question, hits)}")
+    answer = generate(question, hits)
+    print(f"\n[답변]\n{answer}")
     print("\n[출처]")
-    for c, score in hits:
-        print(f"  - {c['doc']} p.{c['page']} (score {score:.3f})")
+    for (doc, page), nums in cited(answer, hits).items():
+        print(f"  {''.join(f'[{n}]' for n in nums)} {doc} p.{page}")
 
 
 if __name__ == "__main__":

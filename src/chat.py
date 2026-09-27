@@ -12,7 +12,7 @@ import pathlib
 import numpy as np
 import requests
 
-from ask import DATA, LLM, answer_rules, build_context, search
+from ask import CITE, CITE_RE, DATA, LLM, answer_rules, build_context, cited, search
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 KEEP_TURNS = 4  # 프롬프트에 남길 이전 대화 수
@@ -51,7 +51,7 @@ ANSWER = """당신은 DGIST 행정 매뉴얼 안내 도우미다.
 
 아래 [참고 문서]만 근거로 답하라. 문서에 없는 내용은 절대 지어내지 말고,
 근거가 없으면 "제공된 매뉴얼에서 찾을 수 없습니다"라고만 답하라.
-절차를 설명할 때는 각 단계 끝에 [문서명 p.페이지] 형식으로 출처를 붙여라.
+{cite}
 {rules}
 [이전 대화]
 {history}
@@ -118,11 +118,15 @@ def rewrite(history, question, improved=True):
 
 
 def format_history(history):
-    """이전 청크는 버리고 Q/A 텍스트만 남긴다 (컨텍스트가 무한히 늘지 않도록)."""
+    """이전 청크는 버리고 Q/A 텍스트만 남긴다 (컨텍스트가 무한히 늘지 않도록).
+
+    이전 답변의 [번호] 인용은 지운다. 그 번호는 지난 턴의 참고 문서를 가리키므로
+    남겨 두면 이번 턴의 [1], [2] 와 헷갈린다.
+    """
     if not history:
         return "(없음)"
     return "\n".join(
-        f"Q: {q}\nA: {a[:KEEP_CHARS]}" for q, a in history[-KEEP_TURNS:]
+        f"Q: {q}\nA: {CITE_RE.sub('', a)[:KEEP_CHARS]}" for q, a in history[-KEEP_TURNS:]
     )
 
 
@@ -150,17 +154,21 @@ def main():
 
         hits = search(query, chunks, vectors)
         for rank, (c, score) in enumerate(hits, start=1):
-            print(f"  #{rank} {score:.3f}  {c['doc']} p.{c['page']}")
+            print(f"  [{rank}] {score:.3f}  {c['doc']} p.{c['page']}")
 
         answer = call(
             ANSWER.format(
-                rules=answer_rules(),
+                cite=CITE,
+                rules=answer_rules(hits=hits),
                 history=format_history(history),
                 context=build_context(hits),
                 question=question,
             )
         )
         print(f"\n{answer}\n")
+        for (doc, page), nums in cited(answer, hits).items():
+            print(f"  {''.join(f'[{n}]' for n in nums)} {doc} p.{page}")
+        print()
         history.append((question, answer))
 
 
