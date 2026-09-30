@@ -5,6 +5,7 @@
 
 # 인덱스 산출물 - build 스크립트로 재생성 가능하고, 원문 텍스트를 담고 있다
 data/
+data_*/
 data_vlm*/
 
 # VLM 이 페이지에서 읽어낸 본문 캐시 - 문서 내용 그 자체다
@@ -14,7 +15,8 @@ cache/
 screenshots/
 
 # 평가셋 - 모범답안에 문서 원문이 담겨 있다 (이후 평가 결과 파일도 마찬가지)
-eval/
+eval/*
+!eval/evaluate.py
 
 # Python
 __pycache__/

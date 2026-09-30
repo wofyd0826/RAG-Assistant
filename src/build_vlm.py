@@ -134,12 +134,17 @@ def read_page(page, cache_path):
 
 
 def split_page(text, doc, page):
-    """빈 줄 단위로 나누되, 마크다운 표는 통째로 한 청크로 유지한다.
+    """빈 줄 단위 문단을 CHUNK 자까지 모은다. 마크다운 표는 쪼개지 않는다.
 
-    표를 따로 떼면 표에 제목이 없어지는 문제가 있다. 실제로
+    표는 앞뒤 문단과 한 청크에 함께 담길 수 있고, 합쳐서 CHUNK 를 넘을 때만 끊는다.
+    예전에는 표를 만날 때마다 무조건 끊어 청크 중앙값이 148자였다. 전자증명서 매뉴얼
+    p.7(670자)이 5조각으로 나뉘어 "⑤ 증명서 종류 선택 후 '확인' 클릭" 이 85자짜리
+    조각으로 떨어졌고, 절차 질문에서 검색되지 않았다.
+
+    표가 새 청크의 맨 앞에 오게 되면 앞 청크의 마지막 줄을 제목으로 붙인다.
     "◎ DGIST에서 제공하는 공용 S/W 목록" 이 앞 청크에 남고 표에는
-    '프로그램명(S/W명)' 뿐이라 "소프트웨어 목록" 질문에 걸리지 않았다.
-    그래서 표 앞의 마지막 줄을 제목으로 함께 넣는다.
+    '프로그램명(S/W명)' 뿐이라 "소프트웨어 목록" 질문에 걸리지 않은 적이 있다.
+    CHUNK 보다 큰 표나 문단은 혼자 한 청크가 된다.
     """
     out, buf = [], ""
 
@@ -148,16 +153,11 @@ def split_page(text, doc, page):
             out.append({"doc": doc, "page": page, "text": body.strip()})
 
     for block in [b.strip() for b in text.split("\n\n") if b.strip()]:
-        if "|" in block and "\n" in block:
-            head = ""
-            if buf.strip():
-                head = buf.strip().split("\n")[-1].strip()[:100]
+        is_table = "|" in block and "\n" in block
+        if buf and len(buf) + len(block) > CHUNK:
+            head = buf.strip().split("\n")[-1].strip()[:100] if is_table else ""
             add(buf)
-            out.append({"doc": doc, "page": page,
-                        "text": f"{head}\n{block}" if head else block})
-            buf = ""
-        elif len(buf) + len(block) > CHUNK:
-            add(buf); buf = block
+            buf = f"{head}\n{block}" if head else block
         else:
             buf = f"{buf}\n\n{block}" if buf else block
     add(buf)
@@ -175,21 +175,47 @@ def split_text(text, doc, page):
             if len(text[i:i + CHUNK]) >= MIN_LEN]
 
 
-def page_title(stem, pageno, text):
-    """본문에 빠진 페이지 제목.
+def squash(s):
+    return "".join(s.split())
 
-    본문에 이미 있거나, 머리말의 문서명을 제목으로 읽은 경우에는 붙이지 않는다.
-    문서명은 search_text 에 이미 들어가 있어 새 정보가 아니다.
+
+def page_heading(stem, pageno, text):
+    """VLM 페이지의 모든 청크 앞에 붙일 머리말.
+
+    본문 첫 줄이 제목을 담은 짧은 줄이면 그 줄을 쓴다. 추출 제목은 "전자증명서 발급 절차"
+    처럼 단계 번호를 빼먹기도 하는데 첫 줄에는 "2-5. 전자증명서 발급 절차" 가 남아 있다.
+    첫 줄이 표 등이라 제목이 없으면 추출 제목을 쓴다(법인카드 p.4).
+    로고 글자나 문서명을 제목으로 읽은 경우는 쓰지 않는다. 문서명은 search_text 에 이미 있다.
     """
     path = TITLES / stem / f"{pageno:03d}.txt"
     if not path.exists():
         return ""
     title = path.read_text(encoding="utf-8").strip()
-    squash = lambda s: "".join(s.split())
-    if (not title or title in NOT_TITLES
-            or squash(title) in squash(text) or squash(title) in squash(stem)):
+    if not title or title in NOT_TITLES or squash(title) in squash(stem):
         return ""
+    first = next((ln for ln in text.splitlines() if ln.strip()), "").strip().strip("#* ").strip()
+    if len(first) <= 120 and not first.startswith("|") and squash(title) in squash(first):
+        return first
     return title
+
+
+def with_heading(chunks, heading):
+    """청크마다 머리말을 붙이고, 머리말 한 줄뿐인 청크는 버린다.
+
+    문단 단위로 나누면 페이지 맨 위 제목이 혼자 청크가 되고("2-5. 전자증명서 발급 절차"),
+    맨 아래 단계 문장("⑤ 증명서 종류 선택 후 '확인' 클릭")은 제목 없이 떨어진다.
+    그러면 질문과 단어가 겹치는 빈 제목 청크가 Top-k 를 차지하고 단계 문장은 검색되지 않았다.
+    """
+    out = []
+    for c in chunks:
+        body = c["text"].strip()
+        if "\n" not in body and squash(heading) in squash(body):
+            continue                      # 머리말만 있는 청크
+        if squash(heading) not in squash(body):
+            # 대괄호로 감싸면 모델이 [1] 같은 인용 번호로 착각해 "[2-5]" 라고 인용했다
+            c["text"] = f"## {heading}\n{body}"
+        out.append(c)
+    return out
 
 
 def embed(texts):
@@ -236,13 +262,14 @@ def main():
         for pageno, (text, how) in enumerate(zip(texts, hows), start=1):
             # VLM 결과(문단·표 구조가 있음)는 문단 단위로, 추출 텍스트는 글자 수로 자른다
             split = split_text if how in ("text", "fallback") else split_page
-            # VLM 본문이 제목 띠를 빠뜨린 페이지는 제목을 모든 청크 앞에 붙인다.
-            # 제목만 다르고 본문이 거의 같은 페이지(법인카드 / 연구비카드 절차)를
-            # 검색도 LLM 도 구분할 수 있게 된다.
-            title = page_title(pdf.stem, pageno, text)
-            for chunk in split(text, pdf.stem, pageno):
-                if title:
-                    chunk["text"] = f"[{title}]\n{chunk['text']}"
+            pieces = split(text, pdf.stem, pageno)
+            # VLM 페이지는 페이지 머리말을 모든 청크 앞에 붙인다. 제목만 다르고 본문이
+            # 거의 같은 페이지(법인카드 / 연구비카드 절차)를 구분하고, 제목과 떨어진
+            # 단계 문장도 그 절차로 검색되게 한다.
+            heading = page_heading(pdf.stem, pageno, text) if split is split_page else ""
+            if heading:
+                pieces = with_heading(pieces, heading)
+            for chunk in pieces:
                 chunk["date"], chunk["lang"] = date, lang
                 # 검색에만 쓰는 텍스트. 문서명을 붙여 두지 않으면 본문에 없는
                 # 단어("업무용", "모바일")로는 그 문서를 찾을 수 없다.

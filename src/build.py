@@ -2,18 +2,24 @@
 
 PDF -> PyMuPDF 텍스트 추출 -> 고정 길이 청킹 -> 임베딩 -> data/
 개선안과의 비교 기준선이므로 의도적으로 가장 단순한 방식을 쓴다.
+
+실행:  python src/build.py          (청크 500자 -> data/)
+       python src/build.py 1000     (청크 1000자 -> data_1000/, 크기 비교 실험용)
 """
 import json
 import pathlib
+import sys
 
 import numpy as np
 import pymupdf
 import requests
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-DATA = ROOT / "data"
+CHUNK = int(sys.argv[1]) if len(sys.argv) > 1 else 500
+OVERLAP = CHUNK // 5    # 20%
+DATA = ROOT / ("data" if CHUNK == 500 else f"data_{CHUNK}")
 EMBED_MODEL = "bge-m3"
-CHUNK, OVERLAP, MIN_LEN = 500, 100, 50
+MIN_LEN = 50
 BATCH = 16
 
 

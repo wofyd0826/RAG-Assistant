@@ -17,6 +17,7 @@ from ask import CITE, CITE_RE, DATA, LLM, answer_rules, build_context, cited, se
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 KEEP_TURNS = 4  # 프롬프트에 남길 이전 대화 수
 KEEP_CHARS = 200  # 이전 답변은 앞부분만 유지 (컨텍스트 절약)
+TEMPERATURE = 0.2  # 평가 스크립트는 0 으로 바꿔 매번 같은 답이 나오게 한다
 
 # 개선 전. 대명사를 자주 놓치고("그건 누가 결재해?" 를 그대로 둠),
 # 재작성할 때는 문장을 늘여 검색을 희석시켰다("이수증은?" -> "...어디에서 발급받는가").
@@ -72,7 +73,7 @@ def call(prompt):
             "messages": [{"role": "user", "content": prompt}],
             "think": False,
             "stream": False,
-            "options": {"num_ctx": 8192, "temperature": 0.2},
+            "options": {"num_ctx": 8192, "temperature": TEMPERATURE},
         },
         timeout=600,
     )
@@ -89,7 +90,7 @@ def call_stream(prompt):
             "messages": [{"role": "user", "content": prompt}],
             "think": False,
             "stream": True,
-            "options": {"num_ctx": 8192, "temperature": 0.2},
+            "options": {"num_ctx": 8192, "temperature": TEMPERATURE},
         },
         stream=True,
         timeout=600,

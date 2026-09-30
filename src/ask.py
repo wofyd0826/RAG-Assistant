@@ -98,15 +98,27 @@ def answer_rules(meta=None, hits=None):
     return DATE_RULE
 
 
-def build_context(hits, meta=None):
+def build_context(hits, meta=None, ordered=True):
     """청크마다 [번호] 를 붙인다. 답변은 이 번호로 출처를 단다.
 
+    번호는 검색 순위 그대로 두고(UI 의 검색 결과·cited() 와 맞추기 위해) 배치만
+    문서별 → 페이지 순으로 바꾼다. 점수 순으로 넣으면 여러 쪽에 걸친 절차가
+    p.8 → p.7 → p.9 → p.4 처럼 뒤섞여 들어가 모델이 단계 순서를 틀리게 답했다.
+    문서끼리는 가장 높은 순위의 청크가 있는 문서부터 놓는다.
+
     meta 모드에서는 작성일을 같이 넣어 LLM 이 최신본을 고를 수 있게 한다.
+    ordered=False 면 검색 점수 순서 그대로 넣는다 (평가의 Baseline 재현용).
     """
     def head(n, c):
         date = f" (작성일 {c.get('date', '미상')})" if _meta(meta) else ""
         return f"[{n}] {c['doc']} p.{c['page']}{date}"
-    return "\n\n".join(f"{head(n, c)}\n{c['text']}" for n, (c, _) in enumerate(hits, start=1))
+    numbered = list(enumerate((c for c, _ in hits), start=1))
+    if ordered:
+        doc_rank = {}
+        for n, c in numbered:
+            doc_rank.setdefault(c["doc"], n)
+        numbered.sort(key=lambda x: (doc_rank[x[1]["doc"]], x[1]["page"], x[0]))
+    return "\n\n".join(f"{head(n, c)}\n{c['text']}" for n, c in numbered)
 
 
 CITE_RE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
